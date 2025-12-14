@@ -7,6 +7,7 @@ import {
   listConversations,
   getMessages,
   getConversation,
+  updateConversationTypst,
 } from "../lib/database";
 import { join } from "path";
 
@@ -107,10 +108,16 @@ async function handleChat(req: Request): Promise<Response> {
         });
 
         if (renderResult.success && renderResult.pages) {
+          const pages = renderResult.pages.map(
+            (p) => `data:image/png;base64,${p}`,
+          );
           typstOutput = {
             code: input.code,
-            pages: renderResult.pages.map((p) => `data:image/png;base64,${p}`),
+            pages,
           };
+
+          // Save Typst output to conversation
+          updateConversationTypst(conversationId, input.code, pages);
 
           // Also render PDF for download
           const pdfResult = await renderTypst({
@@ -203,7 +210,26 @@ function handleGetConversation(conversationId: string): Response {
   }
 
   const messages = getMessages(conversationId);
-  return Response.json({ conversation, messages });
+
+  // Parse typst_pages if present
+  let typstOutput = null;
+  if (conversation.typst_code && conversation.typst_pages) {
+    typstOutput = {
+      code: conversation.typst_code,
+      pages: JSON.parse(conversation.typst_pages),
+    };
+  }
+
+  return Response.json({
+    conversation: {
+      id: conversation.id,
+      created_at: conversation.created_at,
+      updated_at: conversation.updated_at,
+      title: conversation.title,
+    },
+    messages,
+    typstOutput,
+  });
 }
 
 const PORT = process.env.PORT || 3000;
@@ -237,7 +263,12 @@ const server = Bun.serve({
     // Serve static files
     const publicDir = join(import.meta.dir, "../../public");
 
-    let filePath = url.pathname === "/" ? "/index.html" : url.pathname;
+    // For SPA routing, serve index.html for /c/* paths
+    let filePath = url.pathname;
+    if (filePath === "/" || filePath.startsWith("/c/")) {
+      filePath = "/index.html";
+    }
+
     const file = Bun.file(join(publicDir, filePath));
 
     if (await file.exists()) {

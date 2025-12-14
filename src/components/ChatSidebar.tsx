@@ -3,14 +3,23 @@ import ReactMarkdown from "react-markdown";
 import type { Message, TypstOutput } from "../types";
 
 interface ChatSidebarProps {
-  onTypstOutput: (output: TypstOutput) => void;
+  conversationId: string | null;
+  onConversationChange: (id: string | null) => void;
+  onTypstOutput: (output: TypstOutput | null) => void;
+  onShowHistory: () => void;
+  onNewChat: () => void;
 }
 
-export function ChatSidebar({ onTypstOutput }: ChatSidebarProps) {
+export function ChatSidebar({
+  conversationId,
+  onConversationChange,
+  onTypstOutput,
+  onShowHistory,
+  onNewChat,
+}: ChatSidebarProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [conversationId, setConversationId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -20,6 +29,47 @@ export function ChatSidebar({ onTypstOutput }: ChatSidebarProps) {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  // Load conversation when ID changes
+  useEffect(() => {
+    if (conversationId) {
+      loadConversation(conversationId);
+    } else {
+      setMessages([]);
+      onTypstOutput(null);
+    }
+  }, [conversationId]);
+
+  const loadConversation = async (id: string) => {
+    try {
+      const response = await fetch(`/api/conversations/${id}`);
+      if (!response.ok) return;
+
+      const data = await response.json();
+
+      // Convert DB messages to UI messages
+      const uiMessages: Message[] = [];
+      for (const msg of data.messages) {
+        if (msg.source === "user" || msg.source === "assistant") {
+          const content = JSON.parse(msg.content);
+          uiMessages.push({
+            id: String(msg.id),
+            role: msg.source,
+            content: msg.source === "user" ? content.content : content.message,
+            timestamp: new Date(msg.timestamp),
+          });
+        }
+      }
+      setMessages(uiMessages);
+
+      // Restore Typst output
+      if (data.typstOutput) {
+        onTypstOutput(data.typstOutput);
+      }
+    } catch (error) {
+      console.error("Error loading conversation:", error);
+    }
+  };
 
   const sendMessage = async () => {
     if (!input.trim() || isLoading) return;
@@ -54,9 +104,9 @@ export function ChatSidebar({ onTypstOutput }: ChatSidebarProps) {
 
       const data = await response.json();
 
-      // Store conversation ID from first response
-      if (data.conversationId && !conversationId) {
-        setConversationId(data.conversationId);
+      // Update conversation ID if new
+      if (data.conversationId && data.conversationId !== conversationId) {
+        onConversationChange(data.conversationId);
       }
 
       const assistantMessage: Message = {
@@ -93,20 +143,42 @@ export function ChatSidebar({ onTypstOutput }: ChatSidebarProps) {
     }
   };
 
-  const startNewConversation = () => {
-    setMessages([]);
-    setConversationId(null);
-  };
-
   return (
     <div className="chat-sidebar">
       <div className="chat-header">
-        <h2>Typst AI Assistant</h2>
-        {conversationId && (
-          <button className="new-chat-btn" onClick={startNewConversation}>
-            New Chat
+        <h2>Typst AI</h2>
+        <div className="header-actions">
+          <button
+            className="header-btn"
+            onClick={onShowHistory}
+            title="History"
+          >
+            <svg
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+            >
+              <circle cx="12" cy="12" r="10" />
+              <polyline points="12 6 12 12 16 14" />
+            </svg>
           </button>
-        )}
+          <button className="header-btn" onClick={onNewChat} title="New Chat">
+            <svg
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+            >
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+          </button>
+        </div>
       </div>
 
       <div className="chat-messages">

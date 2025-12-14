@@ -36,6 +36,11 @@ export async function renderTypst(
       : join(TEMP_DIR, `${id}.${request.format}`);
 
   try {
+    // Validate input
+    if (!request.code || request.code.trim() === "") {
+      return { success: false, error: "No Typst code provided" };
+    }
+
     // Write Typst source to temp file
     await Bun.write(inputPath, request.code);
 
