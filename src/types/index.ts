@@ -1,14 +1,23 @@
 export interface Message {
   id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "tool";
   content: string;
   timestamp: Date;
   typstOutput?: TypstOutput;
+  toolCall?: ToolCallInfo;
+  isStreaming?: boolean;
+}
+
+export interface ToolCallInfo {
+  name: string;
+  status: "calling" | "executing" | "success" | "error";
+  input?: { code: string; description: string };
+  error?: string;
 }
 
 export interface TypstOutput {
   code: string;
-  pages?: string[]; // base64 encoded page images
+  pages?: string[];
   pdfUrl?: string;
   error?: string;
 }
@@ -26,18 +35,10 @@ export interface TypstRenderRequest {
 
 export interface TypstRenderResponse {
   success: boolean;
-  data?: string; // base64 encoded (single file)
-  pages?: string[]; // base64 encoded pages
+  data?: string;
+  pages?: string[];
   mimeType?: string;
   error?: string;
-}
-
-export interface ToolCall {
-  name: "render_typst";
-  input: {
-    code: string;
-    description: string;
-  };
 }
 
 export interface ConversationRequest {

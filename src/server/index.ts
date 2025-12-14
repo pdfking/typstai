@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { renderTypst, typstToolDefinition } from "../tools/typst-renderer";
-import type { ConversationRequest, TypstOutput } from "../types";
+import type { TypstOutput } from "../types";
 import {
   logMessage,
   generateConversationId,
@@ -54,144 +54,220 @@ interface MessageParam {
   content: string;
 }
 
-interface ConversationRequestWithId extends ConversationRequest {
+interface ConversationRequest {
+  messages: { role: "user" | "assistant"; content: string }[];
   conversationId?: string;
 }
 
-async function handleChat(req: Request): Promise<Response> {
-  try {
-    const body = (await req.json()) as ConversationRequestWithId;
-    const { messages } = body;
-    const conversationId = body.conversationId || generateConversationId();
+async function handleChatStream(req: Request): Promise<Response> {
+  const body = (await req.json()) as ConversationRequest;
+  const { messages } = body;
+  const conversationId = body.conversationId || generateConversationId();
 
-    // Log the user message (last one in the array)
-    const lastUserMessage = messages[messages.length - 1];
-    if (lastUserMessage) {
-      logMessage(conversationId, "user", lastUserMessage);
-    }
+  // Log the user message
+  const lastUserMessage = messages[messages.length - 1];
+  if (lastUserMessage) {
+    logMessage(conversationId, "user", lastUserMessage);
+  }
 
-    const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 4096,
-      system: SYSTEM_PROMPT,
-      tools: [typstToolDefinition],
-      messages: messages as MessageParam[],
-    });
+  const encoder = new TextEncoder();
 
-    let assistantMessage = "";
-    let typstOutput: TypstOutput | undefined;
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (event: string, data: unknown) => {
+        controller.enqueue(
+          encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
+        );
+      };
 
-    for (const block of response.content) {
-      if (block.type === "text") {
-        assistantMessage += block.text;
-      } else if (block.type === "tool_use" && block.name === "render_typst") {
-        const input = block.input as { code: string; description: string };
+      try {
+        // Send conversation ID immediately
+        send("conversation_id", { conversationId });
 
-        // Log tool call
-        logMessage(conversationId, "tool_call", {
-          tool: "render_typst",
-          input,
-        });
-
-        // Render the Typst code to PNG pages
-        const renderResult = await renderTypst({
-          code: input.code,
-          format: "png",
-        });
-
-        // Log tool result
-        logMessage(conversationId, "tool_result", {
-          tool: "render_typst",
-          success: renderResult.success,
-          pageCount: renderResult.pages?.length,
-          error: renderResult.error,
-        });
-
-        if (renderResult.success && renderResult.pages) {
-          const pages = renderResult.pages.map(
-            (p) => `data:image/png;base64,${p}`,
-          );
-          typstOutput = {
-            code: input.code,
-            pages,
-          };
-
-          // Save Typst output to conversation
-          updateConversationTypst(conversationId, input.code, pages);
-
-          // Also render PDF for download
-          const pdfResult = await renderTypst({
-            code: input.code,
-            format: "pdf",
-          });
-
-          if (pdfResult.success && pdfResult.data) {
-            typstOutput.pdfUrl = `data:application/pdf;base64,${pdfResult.data}`;
-          }
-        } else {
-          typstOutput = {
-            code: input.code,
-            error: renderResult.error,
-          };
-        }
-
-        // Get tool result response from Claude
-        const toolResultResponse = await anthropic.messages.create({
+        // Start streaming from Claude
+        const stream = anthropic.messages.stream({
           model: "claude-sonnet-4-20250514",
-          max_tokens: 1024,
+          max_tokens: 4096,
           system: SYSTEM_PROMPT,
           tools: [typstToolDefinition],
-          messages: [
-            ...(messages as MessageParam[]),
-            {
-              role: "assistant",
-              content: response.content,
-            },
-            {
-              role: "user",
-              content: [
-                {
-                  type: "tool_result",
-                  tool_use_id: block.id,
-                  content: renderResult.success
-                    ? `Document rendered successfully: ${input.description}`
-                    : `Error rendering document: ${renderResult.error}`,
-                },
-              ],
-            },
-          ] as Anthropic.MessageParam[],
+          messages: messages as MessageParam[],
         });
 
-        // Extract text from tool result response
-        for (const resultBlock of toolResultResponse.content) {
-          if (resultBlock.type === "text") {
-            assistantMessage +=
-              (assistantMessage ? "\n\n" : "") + resultBlock.text;
+        let currentText = "";
+        let toolUseBlock: { id: string; name: string; input: string } | null =
+          null;
+        let typstOutput: TypstOutput | undefined;
+
+        stream.on("text", (text) => {
+          currentText += text;
+          send("text", { text });
+        });
+
+        stream.on("contentBlockStart", (block) => {
+          if (block.content_block.type === "tool_use") {
+            toolUseBlock = {
+              id: block.content_block.id,
+              name: block.content_block.name,
+              input: "",
+            };
+            send("tool_start", {
+              tool: block.content_block.name,
+              id: block.content_block.id,
+            });
+          }
+        });
+
+        stream.on("inputJson", (json) => {
+          if (toolUseBlock) {
+            toolUseBlock.input += json;
+          }
+        });
+
+        stream.on("contentBlockStop", async (block) => {
+          if (block.content_block.type === "tool_use" && toolUseBlock) {
+            const input = JSON.parse(toolUseBlock.input) as {
+              code: string;
+              description: string;
+            };
+
+            // Log tool call
+            logMessage(conversationId, "tool_call", {
+              tool: toolUseBlock.name,
+              input,
+            });
+
+            send("tool_input", {
+              tool: toolUseBlock.name,
+              input,
+            });
+
+            // Execute the tool
+            send("tool_executing", { tool: toolUseBlock.name });
+
+            const renderResult = await renderTypst({
+              code: input.code,
+              format: "png",
+            });
+
+            // Log tool result
+            logMessage(conversationId, "tool_result", {
+              tool: toolUseBlock.name,
+              success: renderResult.success,
+              pageCount: renderResult.pages?.length,
+              error: renderResult.error,
+            });
+
+            if (renderResult.success && renderResult.pages) {
+              const pages = renderResult.pages.map(
+                (p) => `data:image/png;base64,${p}`,
+              );
+              typstOutput = {
+                code: input.code,
+                pages,
+              };
+
+              // Save to DB
+              updateConversationTypst(conversationId, input.code, pages);
+
+              // Render PDF
+              const pdfResult = await renderTypst({
+                code: input.code,
+                format: "pdf",
+              });
+
+              if (pdfResult.success && pdfResult.data) {
+                typstOutput.pdfUrl = `data:application/pdf;base64,${pdfResult.data}`;
+              }
+
+              send("tool_result", {
+                tool: toolUseBlock.name,
+                success: true,
+                output: typstOutput,
+              });
+            } else {
+              typstOutput = {
+                code: input.code,
+                error: renderResult.error,
+              };
+              send("tool_result", {
+                tool: toolUseBlock.name,
+                success: false,
+                error: renderResult.error,
+                code: input.code,
+              });
+            }
+
+            toolUseBlock = null;
+          }
+        });
+
+        const response = await stream.finalMessage();
+
+        // If there was a tool use, get the follow-up response
+        if (response.stop_reason === "tool_use") {
+          const toolBlock = response.content.find((b) => b.type === "tool_use");
+          if (toolBlock && toolBlock.type === "tool_use") {
+            send("assistant_continue", {});
+
+            const followUp = anthropic.messages.stream({
+              model: "claude-sonnet-4-20250514",
+              max_tokens: 1024,
+              system: SYSTEM_PROMPT,
+              tools: [typstToolDefinition],
+              messages: [
+                ...(messages as MessageParam[]),
+                { role: "assistant", content: response.content },
+                {
+                  role: "user",
+                  content: [
+                    {
+                      type: "tool_result",
+                      tool_use_id: toolBlock.id,
+                      content: typstOutput?.error
+                        ? `Error: ${typstOutput.error}`
+                        : "Document rendered successfully",
+                    },
+                  ],
+                },
+              ] as Anthropic.MessageParam[],
+            });
+
+            followUp.on("text", (text) => {
+              currentText += text;
+              send("text", { text });
+            });
+
+            await followUp.finalMessage();
           }
         }
+
+        // Log final assistant message
+        logMessage(conversationId, "assistant", {
+          message: currentText,
+          hasTypstOutput: !!typstOutput,
+          typstCode: typstOutput?.code,
+          typstError: typstOutput?.error,
+        });
+
+        send("done", { message: currentText });
+        controller.close();
+      } catch (error) {
+        console.error("Stream error:", error);
+        send("error", {
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
+        controller.close();
       }
-    }
+    },
+  });
 
-    // Log assistant response
-    logMessage(conversationId, "assistant", {
-      message: assistantMessage,
-      hasTypstOutput: !!typstOutput,
-      typstCode: typstOutput?.code,
-      typstError: typstOutput?.error,
-    });
-
-    return Response.json({
-      message: assistantMessage,
-      typstOutput,
-      conversationId,
-    });
-  } catch (error) {
-    console.error("Chat error:", error);
-    return Response.json(
-      { error: error instanceof Error ? error.message : "Unknown error" },
-      { status: 500 },
-    );
-  }
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
 }
 
 function handleListConversations(req: Request): Response {
@@ -241,7 +317,7 @@ const server = Bun.serve({
 
     // API routes
     if (url.pathname === "/api/chat" && req.method === "POST") {
-      return handleChat(req);
+      return handleChatStream(req);
     }
 
     if (url.pathname === "/api/conversations" && req.method === "GET") {

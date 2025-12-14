@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
-import type { Message, TypstOutput } from "../types";
+import type { Message, TypstOutput, ToolCallInfo } from "../types";
 
 interface ChatSidebarProps {
   conversationId: string | null;
@@ -21,6 +21,7 @@ export function ChatSidebar({
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -50,12 +51,47 @@ export function ChatSidebar({
       // Convert DB messages to UI messages
       const uiMessages: Message[] = [];
       for (const msg of data.messages) {
-        if (msg.source === "user" || msg.source === "assistant") {
-          const content = JSON.parse(msg.content);
+        const content = JSON.parse(msg.content);
+
+        if (msg.source === "user") {
           uiMessages.push({
             id: String(msg.id),
-            role: msg.source,
-            content: msg.source === "user" ? content.content : content.message,
+            role: "user",
+            content: content.content,
+            timestamp: new Date(msg.timestamp),
+          });
+        } else if (msg.source === "tool_call") {
+          uiMessages.push({
+            id: String(msg.id),
+            role: "tool",
+            content: "",
+            timestamp: new Date(msg.timestamp),
+            toolCall: {
+              name: content.tool,
+              status: "calling",
+              input: content.input,
+            },
+          });
+        } else if (msg.source === "tool_result") {
+          // Update the previous tool message with result
+          const lastToolIdx = uiMessages.findLastIndex(
+            (m) => m.role === "tool",
+          );
+          if (lastToolIdx !== -1) {
+            uiMessages[lastToolIdx] = {
+              ...uiMessages[lastToolIdx],
+              toolCall: {
+                ...uiMessages[lastToolIdx].toolCall!,
+                status: content.success ? "success" : "error",
+                error: content.error,
+              },
+            };
+          }
+        } else if (msg.source === "assistant") {
+          uiMessages.push({
+            id: String(msg.id),
+            role: "assistant",
+            content: content.message,
             timestamp: new Date(msg.timestamp),
           });
         }
@@ -85,54 +121,199 @@ export function ChatSidebar({
     setInput("");
     setIsLoading(true);
 
+    // Create streaming assistant message
+    const assistantId = crypto.randomUUID();
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        timestamp: new Date(),
+        isStreaming: true,
+      },
+    ]);
+
+    abortControllerRef.current = new AbortController();
+
     try {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          messages: [...messages, userMessage].map((m) => ({
-            role: m.role,
-            content: m.content,
-          })),
+          messages: [...messages, userMessage]
+            .filter((m) => m.role === "user" || m.role === "assistant")
+            .map((m) => ({
+              role: m.role,
+              content: m.content,
+            })),
           conversationId,
         }),
+        signal: abortControllerRef.current.signal,
       });
 
-      if (!response.ok) {
-        throw new Error("Failed to send message");
-      }
+      if (!response.ok) throw new Error("Failed to send message");
 
-      const data = await response.json();
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("No reader");
 
-      // Update conversation ID if new
-      if (data.conversationId && data.conversationId !== conversationId) {
-        onConversationChange(data.conversationId);
-      }
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let currentToolId: string | null = null;
 
-      const assistantMessage: Message = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: data.message,
-        timestamp: new Date(),
-        typstOutput: data.typstOutput,
-      };
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      setMessages((prev) => [...prev, assistantMessage]);
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
 
-      if (data.typstOutput) {
-        onTypstOutput(data.typstOutput);
+        for (const line of lines) {
+          if (line.startsWith("event: ")) {
+            const event = line.slice(7);
+            const dataLine = lines[lines.indexOf(line) + 1];
+            if (dataLine?.startsWith("data: ")) {
+              const data = JSON.parse(dataLine.slice(6));
+
+              switch (event) {
+                case "conversation_id":
+                  if (data.conversationId !== conversationId) {
+                    onConversationChange(data.conversationId);
+                  }
+                  break;
+
+                case "text":
+                  setMessages((prev) =>
+                    prev.map((m) =>
+                      m.id === assistantId
+                        ? { ...m, content: m.content + data.text }
+                        : m,
+                    ),
+                  );
+                  break;
+
+                case "tool_start":
+                  currentToolId = crypto.randomUUID();
+                  setMessages((prev) => {
+                    // Insert tool message before the streaming assistant message
+                    const assistantIdx = prev.findIndex(
+                      (m) => m.id === assistantId,
+                    );
+                    const newMessages = [...prev];
+                    newMessages.splice(assistantIdx, 0, {
+                      id: currentToolId!,
+                      role: "tool",
+                      content: "",
+                      timestamp: new Date(),
+                      toolCall: {
+                        name: data.tool,
+                        status: "calling",
+                      },
+                    });
+                    return newMessages;
+                  });
+                  break;
+
+                case "tool_input":
+                  if (currentToolId) {
+                    setMessages((prev) =>
+                      prev.map((m) =>
+                        m.id === currentToolId
+                          ? {
+                              ...m,
+                              toolCall: { ...m.toolCall!, input: data.input },
+                            }
+                          : m,
+                      ),
+                    );
+                  }
+                  break;
+
+                case "tool_executing":
+                  if (currentToolId) {
+                    setMessages((prev) =>
+                      prev.map((m) =>
+                        m.id === currentToolId
+                          ? {
+                              ...m,
+                              toolCall: { ...m.toolCall!, status: "executing" },
+                            }
+                          : m,
+                      ),
+                    );
+                  }
+                  break;
+
+                case "tool_result":
+                  if (currentToolId) {
+                    setMessages((prev) =>
+                      prev.map((m) =>
+                        m.id === currentToolId
+                          ? {
+                              ...m,
+                              toolCall: {
+                                ...m.toolCall!,
+                                status: data.success ? "success" : "error",
+                                error: data.error,
+                              },
+                            }
+                          : m,
+                      ),
+                    );
+                  }
+                  if (data.success && data.output) {
+                    onTypstOutput(data.output);
+                  } else if (!data.success) {
+                    onTypstOutput({ code: data.code, error: data.error });
+                  }
+                  currentToolId = null;
+                  break;
+
+                case "done":
+                  setMessages((prev) =>
+                    prev.map((m) =>
+                      m.id === assistantId ? { ...m, isStreaming: false } : m,
+                    ),
+                  );
+                  break;
+
+                case "error":
+                  setMessages((prev) =>
+                    prev.map((m) =>
+                      m.id === assistantId
+                        ? {
+                            ...m,
+                            content: `Error: ${data.error}`,
+                            isStreaming: false,
+                          }
+                        : m,
+                    ),
+                  );
+                  break;
+              }
+            }
+          }
+        }
       }
     } catch (error) {
-      console.error("Error sending message:", error);
-      const errorMessage: Message = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: "Sorry, there was an error processing your request.",
-        timestamp: new Date(),
-      };
-      setMessages((prev) => [...prev, errorMessage]);
+      if ((error as Error).name !== "AbortError") {
+        console.error("Error sending message:", error);
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  content: "Sorry, there was an error processing your request.",
+                  isStreaming: false,
+                }
+              : m,
+          ),
+        );
+      }
     } finally {
       setIsLoading(false);
+      abortControllerRef.current = null;
     }
   };
 
@@ -197,26 +378,20 @@ export function ChatSidebar({
 
         {messages.map((message) => (
           <div key={message.id} className={`chat-message ${message.role}`}>
-            <div className="message-content">
-              <ReactMarkdown>{message.content}</ReactMarkdown>
-            </div>
-            {message.typstOutput?.error && (
-              <div className="typst-error">
-                Error: {message.typstOutput.error}
+            {message.role === "tool" && message.toolCall && (
+              <ToolCallDisplay toolCall={message.toolCall} />
+            )}
+            {message.role !== "tool" && (
+              <div
+                className={`message-content ${message.isStreaming ? "streaming" : ""}`}
+              >
+                <ReactMarkdown>
+                  {message.content || (message.isStreaming ? "..." : "")}
+                </ReactMarkdown>
               </div>
             )}
           </div>
         ))}
-
-        {isLoading && (
-          <div className="chat-message assistant">
-            <div className="message-content loading">
-              <span className="dot">.</span>
-              <span className="dot">.</span>
-              <span className="dot">.</span>
-            </div>
-          </div>
-        )}
 
         <div ref={messagesEndRef} />
       </div>
@@ -231,9 +406,44 @@ export function ChatSidebar({
           rows={3}
         />
         <button onClick={sendMessage} disabled={isLoading || !input.trim()}>
-          Send
+          {isLoading ? "Generating..." : "Send"}
         </button>
       </div>
+    </div>
+  );
+}
+
+function ToolCallDisplay({ toolCall }: { toolCall: ToolCallInfo }) {
+  const [expanded, setExpanded] = useState(false);
+
+  const statusIcon = {
+    calling: "📝",
+    executing: "⚙️",
+    success: "✅",
+    error: "❌",
+  }[toolCall.status];
+
+  const statusText = {
+    calling: "Preparing document...",
+    executing: "Rendering...",
+    success: "Document rendered",
+    error: "Rendering failed",
+  }[toolCall.status];
+
+  return (
+    <div className={`tool-call ${toolCall.status}`}>
+      <div className="tool-header" onClick={() => setExpanded(!expanded)}>
+        <span className="tool-icon">{statusIcon}</span>
+        <span className="tool-name">{statusText}</span>
+        {toolCall.input?.description && (
+          <span className="tool-desc">{toolCall.input.description}</span>
+        )}
+        <span className={`tool-expand ${expanded ? "open" : ""}`}>▶</span>
+      </div>
+      {expanded && toolCall.input?.code && (
+        <pre className="tool-code">{toolCall.input.code}</pre>
+      )}
+      {toolCall.error && <div className="tool-error">{toolCall.error}</div>}
     </div>
   );
 }

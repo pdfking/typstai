@@ -128,6 +128,108 @@ body {
     border-radius: 1rem 1rem 1rem 0.25rem;
 }
 
+.message-content.streaming::after {
+    content: "▌";
+    animation: blink 1s infinite;
+}
+
+@keyframes blink {
+    0%,
+    50% {
+        opacity: 1;
+    }
+    51%,
+    100% {
+        opacity: 0;
+    }
+}
+
+/* Tool Call Display */
+.chat-message.tool {
+    margin-bottom: 0.5rem;
+}
+
+.tool-call {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    overflow: hidden;
+    font-size: 0.875rem;
+}
+
+.tool-call.executing {
+    border-color: var(--accent);
+}
+
+.tool-call.success {
+    border-color: var(--success);
+}
+
+.tool-call.error {
+    border-color: var(--error);
+}
+
+.tool-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.tool-header:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.tool-icon {
+    font-size: 1rem;
+}
+
+.tool-name {
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.tool-desc {
+    color: var(--text-secondary);
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tool-expand {
+    color: var(--text-secondary);
+    font-size: 0.625rem;
+    transition: transform 0.2s;
+}
+
+.tool-expand.open {
+    transform: rotate(90deg);
+}
+
+.tool-code {
+    background: rgba(0, 0, 0, 0.3);
+    padding: 0.75rem;
+    margin: 0;
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    max-height: 200px;
+    overflow: auto;
+    white-space: pre-wrap;
+    border-top: 1px solid var(--border);
+}
+
+.tool-error {
+    background: rgba(239, 68, 68, 0.1);
+    color: var(--error);
+    padding: 0.5rem 0.75rem;
+    font-size: 0.8125rem;
+    border-top: 1px solid var(--border);
+}
+
 .message-content {
     padding: 0.75rem 1rem;
 }
