@@ -303,7 +303,9 @@ function handleListConversations(req: Request): Response {
   return Response.json({ conversations });
 }
 
-function handleGetConversation(conversationId: string): Response {
+async function handleGetConversation(
+  conversationId: string,
+): Promise<Response> {
   const conversation = getConversation(conversationId);
   if (!conversation) {
     return Response.json({ error: "Conversation not found" }, { status: 404 });
@@ -311,13 +313,23 @@ function handleGetConversation(conversationId: string): Response {
 
   const messages = getMessages(conversationId);
 
-  // Parse typst_pages if present
+  // Parse typst_pages and regenerate PDF if present
   let typstOutput = null;
   if (conversation.typst_code && conversation.typst_pages) {
     typstOutput = {
       code: conversation.typst_code,
       pages: JSON.parse(conversation.typst_pages),
     };
+
+    // Regenerate PDF for download
+    const pdfResult = await renderTypst({
+      code: conversation.typst_code,
+      format: "pdf",
+    });
+
+    if (pdfResult.success && pdfResult.data) {
+      typstOutput.pdfUrl = `data:application/pdf;base64,${pdfResult.data}`;
+    }
   }
 
   return Response.json({
