@@ -41,6 +41,11 @@ Typst syntax quick reference:
 - Page setup: #set page(paper: "a4", margin: 2cm)
 - Text setup: #set text(font: "...", size: 11pt)
 
+IMPORTANT escaping rules:
+- @ symbol creates label references in Typst. For email addresses or social handles, escape with backslash: user\\@domain.com or \\@username
+- < and > create labels. Escape as \\< and \\> when needed literally
+- # starts function calls. In regular text use \\#
+
 Always produce complete, well-structured Typst documents with appropriate page and text settings.`;
 
 interface MessageParam {
