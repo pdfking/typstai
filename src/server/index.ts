@@ -71,173 +71,197 @@ async function handleChatStream(req: Request): Promise<Response> {
   }
 
   const encoder = new TextEncoder();
+  let controllerClosed = false;
 
   const stream = new ReadableStream({
     async start(controller) {
       const send = (event: string, data: unknown) => {
-        controller.enqueue(
-          encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
-        );
+        if (controllerClosed) return;
+        try {
+          controller.enqueue(
+            encoder.encode(
+              `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`,
+            ),
+          );
+        } catch {
+          // Controller may be closed
+        }
+      };
+
+      const close = () => {
+        if (!controllerClosed) {
+          controllerClosed = true;
+          try {
+            controller.close();
+          } catch {
+            // Already closed
+          }
+        }
       };
 
       try {
         // Send conversation ID immediately
         send("conversation_id", { conversationId });
 
-        // Start streaming from Claude
-        const stream = anthropic.messages.stream({
+        let currentText = "";
+        let typstOutput: TypstOutput | undefined;
+
+        // First API call
+        const response = await anthropic.messages.create({
           model: "claude-sonnet-4-20250514",
           max_tokens: 4096,
           system: SYSTEM_PROMPT,
           tools: [typstToolDefinition],
           messages: messages as MessageParam[],
+          stream: true,
         });
 
-        let currentText = "";
-        let toolUseBlock: { id: string; name: string; input: string } | null =
-          null;
-        let typstOutput: TypstOutput | undefined;
+        let toolUseId = "";
+        let toolName = "";
+        let toolInput = "";
 
-        stream.on("text", (text) => {
-          currentText += text;
-          send("text", { text });
-        });
-
-        stream.on("contentBlockStart", (block) => {
-          if (block.content_block.type === "tool_use") {
-            toolUseBlock = {
-              id: block.content_block.id,
-              name: block.content_block.name,
-              input: "",
-            };
-            send("tool_start", {
-              tool: block.content_block.name,
-              id: block.content_block.id,
-            });
-          }
-        });
-
-        stream.on("inputJson", (json) => {
-          if (toolUseBlock) {
-            toolUseBlock.input += json;
-          }
-        });
-
-        stream.on("contentBlockStop", async (block) => {
-          if (block.content_block.type === "tool_use" && toolUseBlock) {
-            const input = JSON.parse(toolUseBlock.input) as {
-              code: string;
-              description: string;
-            };
-
-            // Log tool call
-            logMessage(conversationId, "tool_call", {
-              tool: toolUseBlock.name,
-              input,
-            });
-
-            send("tool_input", {
-              tool: toolUseBlock.name,
-              input,
-            });
-
-            // Execute the tool
-            send("tool_executing", { tool: toolUseBlock.name });
-
-            const renderResult = await renderTypst({
-              code: input.code,
-              format: "png",
-            });
-
-            // Log tool result
-            logMessage(conversationId, "tool_result", {
-              tool: toolUseBlock.name,
-              success: renderResult.success,
-              pageCount: renderResult.pages?.length,
-              error: renderResult.error,
-            });
-
-            if (renderResult.success && renderResult.pages) {
-              const pages = renderResult.pages.map(
-                (p) => `data:image/png;base64,${p}`,
-              );
-              typstOutput = {
-                code: input.code,
-                pages,
-              };
-
-              // Save to DB
-              updateConversationTypst(conversationId, input.code, pages);
-
-              // Render PDF
-              const pdfResult = await renderTypst({
-                code: input.code,
-                format: "pdf",
-              });
-
-              if (pdfResult.success && pdfResult.data) {
-                typstOutput.pdfUrl = `data:application/pdf;base64,${pdfResult.data}`;
+        for await (const event of response) {
+          if (event.type === "content_block_start") {
+            if (event.content_block.type === "text") {
+              // Text block starting
+            } else if (event.content_block.type === "tool_use") {
+              toolUseId = event.content_block.id;
+              toolName = event.content_block.name;
+              toolInput = "";
+              send("tool_start", { tool: toolName, id: toolUseId });
+            }
+          } else if (event.type === "content_block_delta") {
+            if (event.delta.type === "text_delta") {
+              currentText += event.delta.text;
+              send("text", { text: event.delta.text });
+            } else if (event.delta.type === "input_json_delta") {
+              toolInput += event.delta.partial_json;
+            }
+          } else if (event.type === "content_block_stop") {
+            // If we were building a tool use, execute it now
+            if (toolName && toolInput) {
+              let input: { code: string; description: string };
+              try {
+                input = JSON.parse(toolInput);
+              } catch {
+                input = { code: "", description: "" };
               }
 
-              send("tool_result", {
-                tool: toolUseBlock.name,
-                success: true,
-                output: typstOutput,
+              // Log tool call
+              logMessage(conversationId, "tool_call", {
+                tool: toolName,
+                input,
               });
-            } else {
-              typstOutput = {
+
+              send("tool_input", { tool: toolName, input });
+              send("tool_executing", { tool: toolName });
+
+              // Execute the tool
+              const renderResult = await renderTypst({
                 code: input.code,
-                error: renderResult.error,
-              };
-              send("tool_result", {
-                tool: toolUseBlock.name,
-                success: false,
-                error: renderResult.error,
-                code: input.code,
+                format: "png",
               });
+
+              // Log tool result
+              logMessage(conversationId, "tool_result", {
+                tool: toolName,
+                success: renderResult.success,
+                pageCount: renderResult.pages?.length,
+                error: renderResult.error,
+              });
+
+              if (renderResult.success && renderResult.pages) {
+                const pages = renderResult.pages.map(
+                  (p) => `data:image/png;base64,${p}`,
+                );
+                typstOutput = { code: input.code, pages };
+
+                // Save to DB
+                updateConversationTypst(conversationId, input.code, pages);
+
+                // Render PDF
+                const pdfResult = await renderTypst({
+                  code: input.code,
+                  format: "pdf",
+                });
+
+                if (pdfResult.success && pdfResult.data) {
+                  typstOutput.pdfUrl = `data:application/pdf;base64,${pdfResult.data}`;
+                }
+
+                send("tool_result", {
+                  tool: toolName,
+                  success: true,
+                  output: typstOutput,
+                });
+              } else {
+                typstOutput = { code: input.code, error: renderResult.error };
+                send("tool_result", {
+                  tool: toolName,
+                  success: false,
+                  error: renderResult.error,
+                  code: input.code,
+                });
+              }
+
+              // Reset for next tool
+              toolName = "";
+              toolInput = "";
             }
-
-            toolUseBlock = null;
+          } else if (event.type === "message_stop") {
+            // Message complete
           }
-        });
+        }
 
-        const response = await stream.finalMessage();
+        // Check if we need a follow-up for tool result
+        if (toolUseId && typstOutput) {
+          send("assistant_continue", {});
 
-        // If there was a tool use, get the follow-up response
-        if (response.stop_reason === "tool_use") {
-          const toolBlock = response.content.find((b) => b.type === "tool_use");
-          if (toolBlock && toolBlock.type === "tool_use") {
-            send("assistant_continue", {});
+          const followUpResponse = await anthropic.messages.create({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 1024,
+            system: SYSTEM_PROMPT,
+            tools: [typstToolDefinition],
+            messages: [
+              ...(messages as MessageParam[]),
+              {
+                role: "assistant",
+                content: [
+                  ...(currentText
+                    ? [{ type: "text" as const, text: currentText }]
+                    : []),
+                  {
+                    type: "tool_use" as const,
+                    id: toolUseId,
+                    name: "render_typst",
+                    input: JSON.parse(toolInput || "{}"),
+                  },
+                ],
+              },
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result" as const,
+                    tool_use_id: toolUseId,
+                    content: typstOutput.error
+                      ? `Error: ${typstOutput.error}`
+                      : "Document rendered successfully",
+                  },
+                ],
+              },
+            ],
+            stream: true,
+          });
 
-            const followUp = anthropic.messages.stream({
-              model: "claude-sonnet-4-20250514",
-              max_tokens: 1024,
-              system: SYSTEM_PROMPT,
-              tools: [typstToolDefinition],
-              messages: [
-                ...(messages as MessageParam[]),
-                { role: "assistant", content: response.content },
-                {
-                  role: "user",
-                  content: [
-                    {
-                      type: "tool_result",
-                      tool_use_id: toolBlock.id,
-                      content: typstOutput?.error
-                        ? `Error: ${typstOutput.error}`
-                        : "Document rendered successfully",
-                    },
-                  ],
-                },
-              ] as Anthropic.MessageParam[],
-            });
-
-            followUp.on("text", (text) => {
-              currentText += text;
-              send("text", { text });
-            });
-
-            await followUp.finalMessage();
+          for await (const event of followUpResponse) {
+            if (
+              event.type === "content_block_delta" &&
+              event.delta.type === "text_delta"
+            ) {
+              currentText += event.delta.text;
+              send("text", { text: event.delta.text });
+            }
           }
         }
 
@@ -250,13 +274,13 @@ async function handleChatStream(req: Request): Promise<Response> {
         });
 
         send("done", { message: currentText });
-        controller.close();
+        close();
       } catch (error) {
         console.error("Stream error:", error);
         send("error", {
           error: error instanceof Error ? error.message : "Unknown error",
         });
-        controller.close();
+        close();
       }
     },
   });
