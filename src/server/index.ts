@@ -348,6 +348,7 @@ const PORT = process.env.PORT || 3000;
 
 const server = Bun.serve({
   port: PORT,
+  idleTimeout: 120, // 2 minutes for long renders
   async fetch(req) {
     const url = new URL(req.url);
 
