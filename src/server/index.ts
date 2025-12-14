@@ -156,10 +156,10 @@ async function handleChatStream(req: Request): Promise<Response> {
               send("tool_input", { tool: toolName, input });
               send("tool_executing", { tool: toolName });
 
-              // Execute the tool
+              // Execute the tool - use SVG for preview
               const renderResult = await renderTypst({
                 code: input.code,
-                format: "png",
+                format: "svg",
               });
 
               // Log tool result
@@ -171,8 +171,10 @@ async function handleChatStream(req: Request): Promise<Response> {
               });
 
               if (renderResult.success && renderResult.pages) {
+                // SVG pages are raw SVG strings, wrap in data URI
                 const pages = renderResult.pages.map(
-                  (p) => `data:image/png;base64,${p}`,
+                  (svg) =>
+                    `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`,
                 );
                 typstOutput = { code: input.code, pages };
 
@@ -313,22 +315,34 @@ async function handleGetConversation(
 
   const messages = getMessages(conversationId);
 
-  // Parse typst_pages and regenerate PDF if present
+  // Regenerate SVG pages and PDF from saved code
   let typstOutput = null;
-  if (conversation.typst_code && conversation.typst_pages) {
-    typstOutput = {
+  if (conversation.typst_code) {
+    // Render SVG pages
+    const svgResult = await renderTypst({
       code: conversation.typst_code,
-      pages: JSON.parse(conversation.typst_pages),
-    };
-
-    // Regenerate PDF for download
-    const pdfResult = await renderTypst({
-      code: conversation.typst_code,
-      format: "pdf",
+      format: "svg",
     });
 
-    if (pdfResult.success && pdfResult.data) {
-      typstOutput.pdfUrl = `data:application/pdf;base64,${pdfResult.data}`;
+    if (svgResult.success && svgResult.pages) {
+      const pages = svgResult.pages.map(
+        (svg) =>
+          `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`,
+      );
+      typstOutput = {
+        code: conversation.typst_code,
+        pages,
+      };
+
+      // Render PDF for download
+      const pdfResult = await renderTypst({
+        code: conversation.typst_code,
+        format: "pdf",
+      });
+
+      if (pdfResult.success && pdfResult.data) {
+        typstOutput.pdfUrl = `data:application/pdf;base64,${pdfResult.data}`;
+      }
     }
   }
 

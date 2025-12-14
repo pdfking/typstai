@@ -16,7 +16,7 @@ export interface TypstRenderRequest {
 export interface TypstRenderResponse {
   success: boolean;
   data?: string; // base64 encoded (single file for PDF)
-  pages?: string[]; // base64 encoded pages (for PNG)
+  pages?: string[]; // base64/svg pages
   mimeType?: string;
   error?: string;
 }
@@ -29,11 +29,11 @@ export async function renderTypst(
   const id = crypto.randomUUID();
   const inputPath = join(TEMP_DIR, `${id}.typ`);
 
-  // For PNG, typst outputs {name}-{page}.png pattern
-  const outputPath =
-    request.format === "png"
-      ? join(TEMP_DIR, `${id}-{n}.png`)
-      : join(TEMP_DIR, `${id}.${request.format}`);
+  // For multi-page formats, typst outputs {name}-{page}.ext pattern
+  const isMultiPage = request.format === "png" || request.format === "svg";
+  const outputPath = isMultiPage
+    ? join(TEMP_DIR, `${id}-{n}.${request.format}`)
+    : join(TEMP_DIR, `${id}.${request.format}`);
 
   try {
     // Validate input
@@ -65,22 +65,31 @@ export async function renderTypst(
       svg: "image/svg+xml",
     };
 
-    if (request.format === "png") {
+    if (isMultiPage) {
       // Read all page files
       const files = await readdir(TEMP_DIR);
+      const ext = request.format;
       const pageFiles = files
-        .filter((f) => f.startsWith(`${id}-`) && f.endsWith(".png"))
+        .filter((f) => f.startsWith(`${id}-`) && f.endsWith(`.${ext}`))
         .sort((a, b) => {
-          const numA = parseInt(a.match(/-(\d+)\.png$/)?.[1] || "0");
-          const numB = parseInt(b.match(/-(\d+)\.png$/)?.[1] || "0");
+          const regex = new RegExp(`-(\\d+)\\.${ext}$`);
+          const numA = parseInt(a.match(regex)?.[1] || "0");
+          const numB = parseInt(b.match(regex)?.[1] || "0");
           return numA - numB;
         });
 
       const pages: string[] = [];
       for (const pageFile of pageFiles) {
         const pagePath = join(TEMP_DIR, pageFile);
-        const pageData = await Bun.file(pagePath).arrayBuffer();
-        pages.push(Buffer.from(pageData).toString("base64"));
+        if (request.format === "svg") {
+          // SVG is text, read as string
+          const svgContent = await Bun.file(pagePath).text();
+          pages.push(svgContent);
+        } else {
+          // PNG is binary, base64 encode
+          const pageData = await Bun.file(pagePath).arrayBuffer();
+          pages.push(Buffer.from(pageData).toString("base64"));
+        }
         await unlink(pagePath);
       }
 
@@ -89,10 +98,10 @@ export async function renderTypst(
       return {
         success: true,
         pages,
-        mimeType: mimeTypes.png,
+        mimeType: mimeTypes[request.format],
       };
     } else {
-      // Single file output (PDF, SVG)
+      // Single file output (PDF)
       const actualOutputPath = join(TEMP_DIR, `${id}.${request.format}`);
       const outputData = await Bun.file(actualOutputPath).arrayBuffer();
       const base64 = Buffer.from(outputData).toString("base64");
