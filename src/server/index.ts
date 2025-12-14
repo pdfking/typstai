@@ -39,8 +39,14 @@ Typst syntax quick reference:
 - Set rules: #set element(property: value)
 - Tables: #table(columns: (...), [...cells])
 - Images: #image("path.png")
-- Page setup: #set page(paper: "a4", margin: 2cm)
+- Page setup: #set page(width: auto, height: auto) for content-sized pages
 - Text setup: #set text(font: "...", size: 11pt)
+
+IMPORTANT page sizing rules:
+- NEVER use fixed paper sizes like "a4", "letter" etc. unless explicitly requested for printing
+- ALWAYS use #set page(width: auto, height: auto) to make the page fit the content exactly
+- For cards, tickets, labels etc., set explicit dimensions: #set page(width: 3.5in, height: 2in, margin: 0.25in)
+- The output is for screen viewing, not printing - avoid unnecessary whitespace
 
 IMPORTANT escaping rules:
 - @ symbol creates label references in Typst. For email addresses or social handles, escape with backslash: user\\@domain.com or \\@username
